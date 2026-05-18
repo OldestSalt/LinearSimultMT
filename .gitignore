@@ -2,6 +2,8 @@ models
 runs
 mlruns.db
 mlruns
+mlflow
 data
 checkpoints
 .ipynb_checkpoints
+.idea

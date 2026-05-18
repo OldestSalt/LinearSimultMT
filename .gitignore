@@ -8,3 +8,5 @@ checkpoints
 .ipynb_checkpoints
 .idea
 code
+.venv
+*/__pycache__

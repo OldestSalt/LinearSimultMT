@@ -1,8 +1,8 @@
 import boto3
-import shutil
 import os
 import argparse
 import zipfile
+from pathlib import Path
 
 def download(path: str, bucket: str, dir: bool = False):
     s3 = boto3.client(
@@ -14,7 +14,7 @@ def download(path: str, bucket: str, dir: bool = False):
     s3.download_file(bucket, path, path)
     if dir:
         with zipfile.ZipFile(path, "r") as zip_ref:
-            zip_ref.extractall(path)
+            zip_ref.extractall(path.removesuffix(".zip"))
         os.remove(path)
 
 

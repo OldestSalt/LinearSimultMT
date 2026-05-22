@@ -9,4 +9,5 @@ checkpoints
 .idea
 code
 .venv
+.venv-mamba
 */__pycache__

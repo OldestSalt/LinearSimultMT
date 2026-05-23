@@ -17,9 +17,11 @@ class TrainConfig:
     wait_k: int | list[int] = 5
 
     use_kl_loss: bool = False
+    use_teacher_ce_loss: bool = False 
     use_dataset_ce_loss: bool = True
 
     kl_weight: float = 0.0
+    teacher_ce_weight: float = 0.0
     dataset_ce_weight: float = 0.3
 
     log_dir: str = "./runs/simulmt_waitk"

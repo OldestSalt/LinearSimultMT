@@ -504,29 +504,11 @@ class WaitKMamba2MT(torch.nn.Module):
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """
         Process one token only for selected batch rows.
-
-        This is needed because different examples can finish source reading
-        or generation at different times.
-
-        Args:
-            token_ids:
-                [n_active]
-
-            segment_ids:
-                [n_active]
-
-            position_ids:
-                [n_active]
-
-            indices:
-                [n_active], selected rows in the full batch.
-
-        Returns:
-            hidden:
-                [n_active, d_model]
-
-            caches:
-                full-batch caches with selected rows updated
+    
+        Optimized version:
+            - uses full-batch step when all rows are active;
+            - does not clone full cache tensors;
+            - updates cache in-place with index_copy_.
         """
         if indices.numel() == 0:
             empty = torch.empty(
@@ -536,39 +518,53 @@ class WaitKMamba2MT(torch.nn.Module):
                 dtype=self.src_embedding.weight.dtype,
             )
             return empty, caches
-
+    
+        batch_size = caches[0][0].size(0)
+    
+        # Fast path: all rows are active.
+        # Avoid index_select/index_copy entirely.
+        if (
+            indices.numel() == batch_size
+            and torch.equal(indices, torch.arange(batch_size, device=indices.device))
+        ):
+            return self.step_token(
+                token_ids=token_ids,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
+                caches=caches,
+            )
+    
         x = self._embed_scheduled_token(
             token_ids=token_ids,
             segment_ids=segment_ids,
             position_ids=position_ids,
         ).unsqueeze(1)
-
+    
         new_full_caches = []
-
+    
         for layer, cache in zip(self.layers, caches):
             conv_state, ssm_state = cache
-
-            sub_cache = (
-                conv_state.index_select(0, indices).contiguous(),
-                ssm_state.index_select(0, indices).contiguous(),
+    
+            sub_conv_state = conv_state.index_select(0, indices).contiguous()
+            sub_ssm_state = ssm_state.index_select(0, indices).contiguous()
+    
+            x, new_sub_cache = layer.step(
+                x,
+                (sub_conv_state, sub_ssm_state),
             )
-
-            x, new_sub_cache = layer.step(x, sub_cache)
-
+    
             new_conv_state, new_ssm_state = new_sub_cache
-
-            conv_state = conv_state.clone()
-            ssm_state = ssm_state.clone()
-
+    
+            # Inference-only: safe to update in-place.
             conv_state.index_copy_(0, indices, new_conv_state)
             ssm_state.index_copy_(0, indices, new_ssm_state)
-
+    
             new_full_caches.append((conv_state, ssm_state))
-
+    
         x = self.final_norm(x)
-
+    
         return x[:, 0, :], new_full_caches
-
+    
     def logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)
 
@@ -584,7 +580,7 @@ class WaitKMamba2MT(torch.nn.Module):
         speed: int = 1,
         stop_after_eos_when_full_source_read: bool = True,
         cache_dtype: torch.dtype | None = None,
-    ) -> tuple[torch.Tensor, list[list[int]]]:
+    ) -> torch.Tensor:
         """
         Fast stateful wait-k generation.
 
@@ -724,44 +720,37 @@ class WaitKMamba2MT(torch.nn.Module):
             max_new_tokens,
             max(1, self.cfg.max_target_len - 1),
         )
-
+        
         for step in range(max_steps):
             active_indices = torch.nonzero(~finished, as_tuple=False).flatten()
-
+    
             if active_indices.numel() == 0:
                 break
-
+    
             next_logits = self.logits_from_hidden(
                 hidden.index_select(0, active_indices)
             )
-
+    
             next_active_tokens = next_logits.argmax(dim=-1)
-
+    
             next_token = torch.full(
                 size=(batch_size,),
                 fill_value=self.cfg.pad_token_id,
                 dtype=torch.long,
                 device=device,
             )
-
+    
             next_token.index_copy_(
                 0,
                 active_indices,
                 next_active_tokens,
             )
-
-            # Delay for the token just generated.
-            consumed_source_cpu = consumed_source.detach().cpu().tolist()
-            active_cpu = active_indices.detach().cpu().tolist()
-
-            for i in active_cpu:
-                delays[i].append(int(consumed_source_cpu[i]))
-
+    
             generated = torch.cat(
                 [generated, next_token[:, None]],
                 dim=1,
             )
-
+    
             if stop_after_eos_when_full_source_read:
                 finished |= (
                     next_token.eq(self.cfg.eos_token_id)
@@ -769,28 +758,26 @@ class WaitKMamba2MT(torch.nn.Module):
                 )
             else:
                 finished |= next_token.eq(self.cfg.eos_token_id)
-
+    
             if bool(finished.all().item()):
                 break
-
-            # Prepare state for the next prediction:
-            # source up to k + (step + 1) * speed, then generated target token.
+    
             next_visible = torch.minimum(
                 source_lens,
                 torch.full_like(source_lens, k + (step + 1) * speed),
             ).clamp_min(1)
-
+    
             feed_source_until(next_visible)
-
+    
             active_indices = torch.nonzero(~finished, as_tuple=False).flatten()
-
+    
             if active_indices.numel() == 0:
                 break
-
+    
             active_tokens = next_token.index_select(0, active_indices)
             active_segments = torch.ones_like(active_tokens)
             active_positions = position_ids.index_select(0, active_indices)
-
+    
             new_hidden, caches = self.step_token_indices(
                 token_ids=active_tokens,
                 segment_ids=active_segments,
@@ -798,17 +785,17 @@ class WaitKMamba2MT(torch.nn.Module):
                 caches=caches,
                 indices=active_indices,
             )
-
-            hidden = hidden.clone()
+    
+            # No clone needed in inference.
             hidden.index_copy_(0, active_indices, new_hidden)
-
+    
             position_ids.index_add_(
                 0,
                 active_indices,
                 torch.ones_like(active_indices, dtype=position_ids.dtype),
             )
-
+    
             if generated.size(1) >= self.cfg.max_target_len:
                 break
-
-        return generated, delays
+    
+        return generated

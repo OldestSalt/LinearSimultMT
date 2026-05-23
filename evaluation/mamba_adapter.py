@@ -7,13 +7,6 @@ from .classes import TranslationOutput, TranslationModelAdapter
 
 
 class WaitKMamba2Adapter(TranslationModelAdapter):
-    """
-    Fast adapter for WaitKMamba2MT using Mamba recurrent inference states.
-
-    Unlike the old adapter, it does not call forward_waitk() at every step.
-    It streams scheduled source/target tokens through Mamba exactly once.
-    """
-
     def __init__(
         self,
         *,
@@ -29,7 +22,6 @@ class WaitKMamba2Adapter(TranslationModelAdapter):
         self.tokenizer = tokenizer
         self.name = name
         self.device = torch.device(device)
-
         self.use_amp = use_amp
         self.amp_dtype = amp_dtype
 
@@ -72,6 +64,8 @@ class WaitKMamba2Adapter(TranslationModelAdapter):
         source_ids = source_ids[:, :max_src_len]
         source_mask = source_mask[:, :max_src_len]
 
+        source_lens = source_mask.long().sum(dim=1).clamp_min(1).clamp_max(max_src_len)
+
         cache_dtype = (
             self.amp_dtype
             if self.use_amp and self.device.type == "cuda"
@@ -83,7 +77,7 @@ class WaitKMamba2Adapter(TranslationModelAdapter):
             enabled=self.use_amp and self.device.type == "cuda",
             dtype=self.amp_dtype,
         ):
-            generated, delays = self.model.generate_incremental_waitk(
+            generated = self.model.generate_incremental_waitk(
                 source_ids=source_ids,
                 source_mask=source_mask,
                 target_lang_token_id=self.target_lang_token_id,
@@ -91,15 +85,13 @@ class WaitKMamba2Adapter(TranslationModelAdapter):
                 k=wait_k,
                 speed=speed,
                 stop_after_eos_when_full_source_read=stop_after_eos_when_full_source_read,
-                cache_dtype=cache_dtype
+                cache_dtype=cache_dtype,
             )
 
         first_token_latency_sec = time.perf_counter() - generation_start
         total_batch_time = time.perf_counter() - batch_start
 
         generated_cpu = generated.detach().cpu()
-
-        # Remove initial target language token.
         generated_only = generated_cpu[:, 1:]
 
         hypothesis_texts = self.tokenizer.batch_decode(
@@ -107,8 +99,9 @@ class WaitKMamba2Adapter(TranslationModelAdapter):
             skip_special_tokens=True,
         )
 
-        outputs: list[TranslationOutput] = []
+        source_lens_cpu = source_lens.detach().cpu().tolist()
 
+        outputs: list[TranslationOutput] = []
         batch_size = generated.size(0)
 
         for i in range(batch_size):
@@ -121,12 +114,19 @@ class WaitKMamba2Adapter(TranslationModelAdapter):
             while hyp_ids and hyp_ids[-1] == self.model.cfg.pad_token_id:
                 hyp_ids.pop()
 
+            target_len = max(1, len(hyp_ids))
+
+            delays = [
+                min(source_lens_cpu[i], wait_k + j * speed)
+                for j in range(target_len)
+            ]
+
             outputs.append(
                 TranslationOutput(
                     hypothesis_ids=hyp_ids,
                     hypothesis_text=hypothesis_texts[i],
-                    delays=delays[i],
-                    target_len=max(1, len(delays[i])),
+                    delays=delays,
+                    target_len=target_len,
                     first_token_latency_sec=first_token_latency_sec,
                     generation_time_sec=total_batch_time / max(1, batch_size),
                     extra={

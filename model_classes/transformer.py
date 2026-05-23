@@ -1,4 +1,5 @@
 import torch
+import math
 from .configs import SimulTransformerConfig
 
 

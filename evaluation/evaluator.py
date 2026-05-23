@@ -121,6 +121,23 @@ class SimulMTEvaluator:
         hypotheses = [x.hypothesis_text for x in all_outputs]
         target_lens = [x.target_len for x in all_outputs]
 
+        generation_total_time = float(
+            sum(
+                x.generation_time_sec or 0.0
+                for x in all_outputs
+            )
+        )
+        
+        generation_efficiency = {
+            "generation_total_time_sec": generation_total_time,
+            "generation_ms_per_sentence": float(
+                1000.0 * generation_total_time / len(dataset)
+            ),
+            "generation_target_tokens_per_sec": float(
+                sum(target_lens) / max(generation_total_time, 1e-8)
+            ),
+        }
+
         all_delays = []
 
         for src_len, tgt_len, out in zip(source_lens, target_lens, all_outputs):
@@ -180,6 +197,7 @@ class SimulMTEvaluator:
             **quality,
             **latency,
             **efficiency,
+            **generation_efficiency,
         }
 
         translations = pd.DataFrame(

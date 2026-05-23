@@ -4,6 +4,9 @@ import mlflow.pytorch
 from dataclasses import asdict
 from pathlib import Path
 from .configs import *
+import datetime
+from typing import Any
+import numpy as np
 
 
 def log_configs_to_mlflow(model_cfg, train_cfg):
@@ -29,6 +32,63 @@ def log_gpu_memory_to_mlflow(step: int):
     )
 
 
+def _strip_prefix_if_present(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    if not any(k.startswith(prefix) for k in state_dict.keys()):
+        return state_dict
+
+    return {
+        k[len(prefix):] if k.startswith(prefix) else k: v
+        for k, v in state_dict.items()
+    }
+
+
+def load_model_state_robust(
+    model: torch.nn.Module,
+    model_state_dict: dict[str, torch.Tensor],
+    *,
+    strict: bool = True,
+):
+    """
+    Load model state dict robustly.
+
+    Supports checkpoints saved from:
+        - raw nn.Module
+        - torch.compile OptimizedModule with '_orig_mod.' prefix
+    """
+    raw_model = unwrap_compiled_model(model)
+
+    model_state_dict = _strip_prefix_if_present(
+        model_state_dict,
+        "_orig_mod.",
+    )
+
+    return raw_model.load_state_dict(
+        model_state_dict,
+        strict=strict,
+    )
+
+
+def unwrap_compiled_model(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Return the original module if the model was wrapped by torch.compile.
+
+    torch.compile returns an OptimizedModule with _orig_mod.
+    Saving _orig_mod keeps checkpoint keys stable.
+    """
+    return getattr(model, "_orig_mod", model)
+
+
+def _seconds_from_train_time(train_time: Any) -> float:
+    if train_time is None:
+        return 0.0
+
+    if isinstance(train_time, datetime.timedelta):
+        return float(train_time.total_seconds())
+
+    if isinstance(train_time, (int, float)):
+        return float(train_time)
+
+
 def save_and_log_checkpoint(
     *,
     path,
@@ -37,29 +97,55 @@ def save_and_log_checkpoint(
     scaler,
     model_cfg,
     train_cfg,
-    epoch,
-    global_step,
-    train_time
+    epoch: int,
+    global_step: int,
+    optimizer_step: int,
+    train_time,
+    mlflow_run_id: str | None = None,
+    log_to_mlflow: bool = False,
 ):
+    """
+    Save full training state.
+
+    Contains:
+        - model weights
+        - optimizer state
+        - AMP scaler state
+        - epoch/global_step/optimizer_step
+        - cumulative train time
+        - MLflow run id
+        - RNG states, if provided
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    torch.save(
-        {
-            "model_state_dict": student.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
-            "model_cfg": asdict(model_cfg),
-            "train_cfg": asdict(train_cfg),
-            "epoch": epoch,
-            "global_step": global_step,
-            "train_time": train_time
-        },
-        path,
-    )
+    raw_student = unwrap_compiled_model(student)
 
-    # mlflow.log_artifact(str(path), artifact_path="checkpoints")
+    train_time_seconds = _seconds_from_train_time(train_time)
 
+    checkpoint = {
+        "model_state_dict": raw_student.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+
+        "model_cfg": asdict(model_cfg),
+        "train_cfg": asdict(train_cfg),
+
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "optimizer_step": int(optimizer_step),
+
+        # Keep both for backward/debug convenience.
+        "train_time": train_time,
+        "train_time_seconds": train_time_seconds,
+
+        "mlflow_run_id": mlflow_run_id,
+    }
+
+    torch.save(checkpoint, path)
+
+    if log_to_mlflow:
+        mlflow.log_artifact(str(path), artifact_path="checkpoints")
 
 def prepend_decoder_start_token(
     target_input_ids: torch.Tensor,

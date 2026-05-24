@@ -523,10 +523,7 @@ class WaitKMamba2MT(torch.nn.Module):
     
         # Fast path: all rows are active.
         # Avoid index_select/index_copy entirely.
-        if (
-            indices.numel() == batch_size
-            and torch.equal(indices, torch.arange(batch_size, device=indices.device))
-        ):
+        if indices.numel() == batch_size:
             return self.step_token(
                 token_ids=token_ids,
                 segment_ids=segment_ids,
@@ -622,12 +619,19 @@ class WaitKMamba2MT(torch.nn.Module):
             dtype=cache_dtype,
         )
 
+        max_steps = min(
+            max_new_tokens,
+            max(1, self.cfg.max_target_len - 1),
+        )
+        
         generated = torch.full(
-            size=(batch_size, 1),
-            fill_value=target_lang_token_id,
+            size=(batch_size, 1 + max_steps),
+            fill_value=self.cfg.pad_token_id,
             dtype=torch.long,
             device=device,
         )
+        generated[:, 0] = target_lang_token_id
+        generated_len = 1
 
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
@@ -694,7 +698,6 @@ class WaitKMamba2MT(torch.nn.Module):
         feed_source_until(initial_visible)
 
         # 2. Initial target language token.
-        all_indices = torch.arange(batch_size, device=device)
 
         target_lang_tokens = torch.full(
             size=(batch_size,),
@@ -706,12 +709,11 @@ class WaitKMamba2MT(torch.nn.Module):
         target_segments = torch.ones_like(target_lang_tokens)
         target_positions = position_ids.clone()
 
-        hidden, caches = self.step_token_indices(
+        hidden, caches = self.step_token(
             token_ids=target_lang_tokens,
             segment_ids=target_segments,
             position_ids=target_positions,
             caches=caches,
-            indices=all_indices,
         )
 
         position_ids += 1
@@ -722,34 +724,17 @@ class WaitKMamba2MT(torch.nn.Module):
         )
         
         for step in range(max_steps):
-            active_indices = torch.nonzero(~finished, as_tuple=False).flatten()
-    
-            if active_indices.numel() == 0:
-                break
-    
-            next_logits = self.logits_from_hidden(
-                hidden.index_select(0, active_indices)
+            next_logits = self.logits_from_hidden(hidden)
+            next_token = next_logits.argmax(dim=-1)
+            
+            next_token = torch.where(
+                finished,
+                torch.full_like(next_token, self.cfg.pad_token_id),
+                next_token,
             )
-    
-            next_active_tokens = next_logits.argmax(dim=-1)
-    
-            next_token = torch.full(
-                size=(batch_size,),
-                fill_value=self.cfg.pad_token_id,
-                dtype=torch.long,
-                device=device,
-            )
-    
-            next_token.index_copy_(
-                0,
-                active_indices,
-                next_active_tokens,
-            )
-    
-            generated = torch.cat(
-                [generated, next_token[:, None]],
-                dim=1,
-            )
+                
+            generated[:, generated_len] = next_token
+            generated_len += 1
     
             if stop_after_eos_when_full_source_read:
                 finished |= (
@@ -769,33 +754,32 @@ class WaitKMamba2MT(torch.nn.Module):
     
             feed_source_until(next_visible)
     
-            active_indices = torch.nonzero(~finished, as_tuple=False).flatten()
-    
-            if active_indices.numel() == 0:
-                break
-    
-            active_tokens = next_token.index_select(0, active_indices)
-            active_segments = torch.ones_like(active_tokens)
-            active_positions = position_ids.index_select(0, active_indices)
-    
-            new_hidden, caches = self.step_token_indices(
-                token_ids=active_tokens,
-                segment_ids=active_segments,
-                position_ids=active_positions,
+            pad_token = torch.full_like(next_token, self.cfg.pad_token_id)
+            pad_segment = torch.full_like(next_token, 2)
+            target_segment = torch.ones_like(next_token)
+            
+            step_tokens = torch.where(finished, pad_token, next_token)
+            step_segments = torch.where(finished, pad_segment, target_segment)
+            
+            hidden, caches = self.step_token(
+                token_ids=step_tokens,
+                segment_ids=step_segments,
+                position_ids=position_ids,
                 caches=caches,
-                indices=active_indices,
             )
+            
+            position_ids += 1
     
             # No clone needed in inference.
-            hidden.index_copy_(0, active_indices, new_hidden)
+            #hidden.index_copy_(0, active_indices, new_hidden)
     
-            position_ids.index_add_(
-                0,
-                active_indices,
-                torch.ones_like(active_indices, dtype=position_ids.dtype),
-            )
+            #position_ids.index_add_(
+                #0,
+                #active_indices,
+                #torch.ones_like(active_indices, dtype=position_ids.dtype),
+            #)
     
             if generated.size(1) >= self.cfg.max_target_len:
                 break
     
-        return generated
+        return generated[:, :generated_len]

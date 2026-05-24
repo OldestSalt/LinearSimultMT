@@ -1,4 +1,3 @@
-import datetime
 from pathlib import Path
 import time
 
@@ -334,53 +333,6 @@ def train_waitk_student(
                         d_ce=f"{metrics['loss.dataset_ce']:.4f}",
                         opt_step=optimizer_step,
                     )
-
-                    if (
-                        train_cfg.save_every_steps is not None
-                        and train_cfg.save_every_steps > 0
-                        and optimizer_step % train_cfg.save_every_steps == 0
-                    ):
-                        train_time_delta = datetime.timedelta(
-                            seconds=elapsed_seconds,
-                        )
-
-                        step_path = (
-                            checkpoint_dir
-                            / f"{checkpoint_name_prefix}_step_{optimizer_step}.pt"
-                        )
-
-                        save_and_log_checkpoint(
-                            path=step_path,
-                            student=student,
-                            optimizer=optimizer,
-                            scaler=scaler,
-                            model_cfg=model_cfg,
-                            train_cfg=train_cfg,
-                            epoch=epoch,
-                            global_step=global_step,
-                            optimizer_step=optimizer_step,
-                            train_time=train_time_delta,
-                            mlflow_run_id=active_mlflow_run_id,
-                            log_to_mlflow=log_checkpoints_to_mlflow,
-                        )
-
-                        if save_latest:
-                            latest_path = checkpoint_dir / f"{checkpoint_name_prefix}_latest.pt"
-
-                            save_and_log_checkpoint(
-                                path=latest_path,
-                                student=student,
-                                optimizer=optimizer,
-                                scaler=scaler,
-                                model_cfg=model_cfg,
-                                train_cfg=train_cfg,
-                                epoch=epoch,
-                                global_step=global_step,
-                                optimizer_step=optimizer_step,
-                                train_time=train_time_delta,
-                                mlflow_run_id=active_mlflow_run_id,
-                                log_to_mlflow=False,
-                            )
 
             # Epoch checkpoint.
             elapsed_seconds = previous_train_time_seconds + (

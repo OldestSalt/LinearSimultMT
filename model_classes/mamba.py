@@ -779,7 +779,4 @@ class WaitKMamba2MT(torch.nn.Module):
                 #torch.ones_like(active_indices, dtype=position_ids.dtype),
             #)
     
-            if generated.size(1) >= self.cfg.max_target_len:
-                break
-    
         return generated[:, :generated_len]

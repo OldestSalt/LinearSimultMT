@@ -212,6 +212,65 @@ class WaitKHybridMamba2MT(torch.nn.Module):
         visible = k + tgt_pos * speed
         return ~(src_pos < visible)
 
+    def allocate_encoder_cache(
+        self,
+        batch_size: int,
+        max_seqlen: int | None = None,
+        dtype=None,
+    ):
+        if max_seqlen is None:
+            max_seqlen = self.cfg.max_source_len
+    
+        if dtype is None:
+            dtype = next(self.parameters()).dtype
+    
+        return [
+            layer.allocate_inference_cache(
+                batch_size=batch_size,
+                max_seqlen=max_seqlen,
+                dtype=dtype,
+            )
+            for layer in self.encoder_layers
+        ]
+    
+    
+    def _embed_source_step(
+        self,
+        token_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self.src_embedding(token_ids) * math.sqrt(self.cfg.d_model)
+        x = x + self.src_pos.position_embedding(position_ids)
+        return self.src_pos.dropout(x).unsqueeze(1)
+    
+    
+    def encode_step(
+        self,
+        token_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        caches: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Incrementally encode one source token.
+    
+        Args:
+            token_ids: [batch]
+            position_ids: [batch]
+    
+        Returns:
+            memory_step: [batch, d_model]
+        """
+        x = self._embed_source_step(token_ids, position_ids)
+    
+        new_caches = []
+    
+        for layer, cache in zip(self.encoder_layers, caches):
+            x, new_cache = layer.step(x, cache)
+            new_caches.append(new_cache)
+    
+        x = self.encoder_norm(x)
+        return x[:, 0, :], new_caches
+
     def encode(
         self,
         source_ids: torch.Tensor,
@@ -348,6 +407,60 @@ class WaitKHybridMamba2MT(torch.nn.Module):
         x = self.decoder_norm(x)
         return x[:, 0, :], new_caches
 
+    def encode_step_indices(
+        self,
+        token_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        caches: list[tuple[torch.Tensor, torch.Tensor]],
+        indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Incrementally encode one source token for selected batch rows.
+        Updates full-batch caches in-place.
+        """
+        if indices.numel() == 0:
+            empty = torch.empty(
+                0,
+                self.cfg.d_model,
+                device=position_ids.device,
+                dtype=self.src_embedding.weight.dtype,
+            )
+            return empty, caches
+    
+        batch_size = caches[0][0].size(0)
+    
+        if indices.numel() == batch_size:
+            return self.encode_step(
+                token_ids=token_ids,
+                position_ids=position_ids,
+                caches=caches,
+            )
+    
+        x = self._embed_source_step(token_ids, position_ids)
+    
+        new_full_caches = []
+    
+        for layer, cache in zip(self.encoder_layers, caches):
+            conv_state, ssm_state = cache
+    
+            sub_cache = (
+                conv_state.index_select(0, indices).contiguous(),
+                ssm_state.index_select(0, indices).contiguous(),
+            )
+    
+            x, new_sub_cache = layer.step(x, sub_cache)
+    
+            new_conv_state, new_ssm_state = new_sub_cache
+    
+            conv_state.index_copy_(0, indices, new_conv_state)
+            ssm_state.index_copy_(0, indices, new_ssm_state)
+    
+            new_full_caches.append((conv_state, ssm_state))
+    
+        x = self.encoder_norm(x)
+    
+        return x[:, 0, :], new_full_caches
+
     @torch.inference_mode()
     def generate_waitk(
         self,
@@ -362,36 +475,52 @@ class WaitKHybridMamba2MT(torch.nn.Module):
         cache_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """
-        Efficient streaming inference.
-
-        Key idea: encode the full source once with a causal Mamba encoder.
-        This does not leak future tokens because memory[:, i] depends only on source[:i+1].
-        Wait-k is enforced by cross-attention key_padding_mask at every decoder step.
+        Honest streaming inference for hybrid Mamba2 + cross-attention model.
+    
+        Encoder:
+            incremental source processing.
+    
+        Decoder:
+            incremental target-side Mamba state.
+    
+        Cross-attention:
+            attends to accumulated source memory only.
         """
         self.eval()
+    
         device = source_ids.device
         batch_size, src_len = source_ids.shape
+    
         src_len = min(src_len, self.cfg.max_source_len)
         source_ids = source_ids[:, :src_len]
+    
         if source_mask is None:
             source_mask = source_ids.ne(self.cfg.pad_token_id)
         else:
             source_mask = source_mask[:, :src_len].bool()
-
+    
         source_lens = source_mask.long().sum(dim=1).clamp_min(1).clamp_max(src_len)
-        source_positions = torch.arange(src_len, device=device).unsqueeze(0)
-
-        memory = self.encode(source_ids=source_ids, source_mask=source_mask, causal=True)
-
+    
         if cache_dtype is None:
             cache_dtype = next(self.parameters()).dtype
-        caches = self.allocate_decoder_cache(
+    
+        encoder_caches = self.allocate_encoder_cache(
+            batch_size=batch_size,
+            max_seqlen=self.cfg.max_source_len,
+            dtype=cache_dtype,
+        )
+    
+        decoder_caches = self.allocate_decoder_cache(
             batch_size=batch_size,
             max_seqlen=self.cfg.max_target_len,
             dtype=cache_dtype,
         )
-
-        max_steps = min(max_new_tokens, max(1, self.cfg.max_target_len - 1))
+    
+        max_steps = min(
+            max_new_tokens,
+            max(1, self.cfg.max_target_len - 1),
+        )
+    
         generated = torch.full(
             (batch_size, 1 + max_steps),
             fill_value=self.cfg.pad_token_id,
@@ -399,53 +528,115 @@ class WaitKHybridMamba2MT(torch.nn.Module):
             device=device,
         )
         generated[:, 0] = target_lang_token_id
-
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    
         current_token = torch.full(
             (batch_size,),
             fill_value=target_lang_token_id,
             dtype=torch.long,
             device=device,
         )
-
+    
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    
+        consumed_source = torch.zeros(batch_size, dtype=torch.long, device=device)
+    
+        memory_buffer = torch.zeros(
+            batch_size,
+            src_len,
+            self.cfg.d_model,
+            device=device,
+            dtype=cache_dtype,
+        )
+    
         generated_len = 1
+    
+        source_positions = torch.arange(src_len, device=device).unsqueeze(0)
+    
+        def feed_source_until(target_visible_lens: torch.Tensor):
+            nonlocal encoder_caches, consumed_source, memory_buffer
+    
+            target_visible_lens = torch.minimum(
+                target_visible_lens,
+                source_lens,
+            )
+    
+            while True:
+                active = (~finished) & (consumed_source < target_visible_lens)
+                indices = torch.nonzero(active, as_tuple=False).flatten()
+    
+                if indices.numel() == 0:
+                    break
+    
+                src_pos = consumed_source.index_select(0, indices)
+                token_ids = source_ids[indices, src_pos]
+    
+                memory_step, encoder_caches = self.encode_step_indices(
+                    token_ids=token_ids,
+                    position_ids=src_pos,
+                    caches=encoder_caches,
+                    indices=indices,
+                )
+    
+                memory_buffer[indices, src_pos] = memory_step.to(memory_buffer.dtype)
+    
+                one = torch.ones_like(indices, dtype=consumed_source.dtype)
+                consumed_source.index_add_(0, indices, one)
+    
+        # Initial source prefix.
+        initial_visible = torch.minimum(
+            source_lens,
+            torch.full_like(source_lens, k),
+        ).clamp_min(1)
+    
+        feed_source_until(initial_visible)
+    
         for step in range(max_steps):
             visible_lens = torch.minimum(
                 source_lens,
                 torch.full_like(source_lens, k + step * speed),
             ).clamp_min(1)
-            visible_source_mask = source_mask & (source_positions < visible_lens.unsqueeze(1))
-            memory_key_padding_mask = ~visible_source_mask
-
+    
+            # Ensure source memory is available before predicting current target.
+            feed_source_until(visible_lens)
+    
+            memory_key_padding_mask = ~(
+                source_positions < consumed_source.unsqueeze(1)
+            )
+    
             position_ids = torch.full(
                 (batch_size,),
                 fill_value=step,
                 dtype=torch.long,
                 device=device,
             )
-            hidden, caches = self.decode_step(
+    
+            hidden, decoder_caches = self.decode_step(
                 token_ids=current_token,
                 position_ids=position_ids,
-                memory=memory,
+                memory=memory_buffer,
                 memory_key_padding_mask=memory_key_padding_mask,
-                caches=caches,
+                caches=decoder_caches,
             )
+    
             next_token = self.lm_head(hidden).argmax(dim=-1)
+    
             next_token = torch.where(
                 finished,
                 torch.full_like(next_token, self.cfg.pad_token_id),
                 next_token,
             )
+    
             generated[:, generated_len] = next_token
             generated_len += 1
-
+    
             if stop_after_eos_when_full_source_read:
-                finished |= next_token.eq(self.cfg.eos_token_id) & (visible_lens >= source_lens)
+                finished |= next_token.eq(self.cfg.eos_token_id) & (consumed_source >= source_lens)
             else:
                 finished |= next_token.eq(self.cfg.eos_token_id)
-
+    
             if bool(finished.all().item()):
                 break
+    
             current_token = next_token
-
+    
         return generated[:, :generated_len]

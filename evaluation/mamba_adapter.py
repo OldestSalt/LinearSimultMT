@@ -18,14 +18,12 @@ class WaitKMamba2Adapter(TranslationModelAdapter):
         use_amp: bool = True,
         amp_dtype: torch.dtype = torch.bfloat16,
     ):
-        model = torch.compile(
-            model,
-            mode="reduce-overhead",
-            dynamic=False,
-        )
+        # model = torch.compile(
+        #    model,
+        #    mode="reduce-overhead",
+        #    dynamic=False,
+        # )
         self.model = model.to(device)
-        if self.device.type == "cuda" and self.use_amp and self.amp_dtype == torch.bfloat16:
-            self.model = self.model.to(dtype=torch.bfloat16)
             
         self.tokenizer = tokenizer
         self.name = name
@@ -34,6 +32,9 @@ class WaitKMamba2Adapter(TranslationModelAdapter):
         self.amp_dtype = amp_dtype
 
         self.target_lang_token_id = tokenizer.convert_tokens_to_ids(target_lang)
+
+        # if self.device.type == "cuda" and self.use_amp and self.amp_dtype == torch.bfloat16:
+        #     self.model = self.model.to(dtype=torch.bfloat16)
 
         if self.target_lang_token_id is None or self.target_lang_token_id < 0:
             raise ValueError(f"Unknown target language token: {target_lang}")

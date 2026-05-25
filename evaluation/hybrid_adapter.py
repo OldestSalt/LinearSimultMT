@@ -113,9 +113,10 @@ class WaitKHybridMamba2Adapter(TranslationModelAdapter):
                     generation_time_sec=total_batch_time / max(1, batch_size),
                     extra={
                         "hybrid": True,
-                        "causal_source_encode_once": True,
+                        "honest_streaming_encoder": True,
+                        "causal_source_encode_once": False,
                         "target_lang_token_id": self.target_lang_token_id,
-                    },
+                    }
                 )
             )
         return outputs

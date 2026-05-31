@@ -35,19 +35,30 @@ class SimulMTEvaluator:
         max_new_tokens: int = 64,
         show_progress: bool = True,
         accurate_timing: bool = False,
+        dataset_fraction: float = 1.0,
         **generation_kwargs: Any,
     ) -> EvaluationResult:
         if len(dataset) == 0:
             raise ValueError("dataset is empty")
-        torch.cuda.reset_peak_memory_stats()
-
-        gc.collect()
-
-        dataloader = torch.utils.data.DataLoader(
+        
+        eval_dataset = make_fraction_subset(
             dataset,
+            dataset_fraction=dataset_fraction,
+        )
+        
+        if len(eval_dataset) == 0:
+            raise ValueError("eval_dataset is empty")
+        
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        
+        gc.collect()
+        
+        dataloader = torch.utils.data.DataLoader(
+            eval_dataset,
             batch_size=batch_size,
             shuffle=False,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
 
         all_outputs: list[TranslationOutput] = []
@@ -131,7 +142,7 @@ class SimulMTEvaluator:
         generation_efficiency = {
             "generation_total_time_sec": generation_total_time,
             "generation_ms_per_sentence": float(
-                1000.0 * generation_total_time / len(dataset)
+                1000.0 * generation_total_time / len(eval_dataset)
             ),
             "generation_target_tokens_per_sec": float(
                 sum(target_lens) / max(generation_total_time, 1e-8)
@@ -182,7 +193,7 @@ class SimulMTEvaluator:
 
         efficiency = {
             "total_time_sec": float(total_time),
-            "ms_per_sentence": float(1000.0 * total_time / len(dataset)),
+            "ms_per_sentence": float(1000.0 * total_time / len(eval_dataset)),
             "target_tokens_per_sec": float(total_target_tokens / max(total_time, 1e-8)),
             "source_tokens_per_sec": float(total_source_tokens / max(total_time, 1e-8)),
             "first_token_latency_sec": (
@@ -191,6 +202,9 @@ class SimulMTEvaluator:
                 else None
             ),
             "peak_gpu_memory_mb": peak_gpu_memory_mb,
+            "dataset_fraction": float(dataset_fraction),
+            "eval_dataset_size": int(len(eval_dataset)),
+            "full_dataset_size": int(len(dataset)),
         }
 
         metrics = {

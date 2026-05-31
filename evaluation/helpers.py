@@ -70,3 +70,26 @@ def default_waitk_delays(
         min(source_len, wait_k + i)
         for i in range(target_len)
     ]
+
+
+def make_fraction_subset(
+    dataset,
+    dataset_fraction: float,
+):
+    """
+    Return deterministic prefix subset of dataset.
+
+    dataset_fraction:
+        1.0 -> full dataset
+        0.1 -> first 10%
+    """
+    if not (0.0 < dataset_fraction <= 1.0):
+        raise ValueError("dataset_fraction must be in the interval (0, 1].")
+
+    if dataset_fraction == 1.0:
+        return dataset
+
+    subset_size = max(1, int(len(dataset) * dataset_fraction))
+    indices = torch.arange(subset_size).tolist()
+
+    return torch.utils.data.Subset(dataset, indices)

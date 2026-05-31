@@ -158,66 +158,82 @@ class NLLBSimulMTAdapter:
         wait_k: int,
         max_new_tokens: int,
         speed: int = 1,
+        mode: str = "simulmt",
         stop_after_eos_when_full_source_read: bool = True,
         **generation_kwargs: Any,
     ) -> list[TranslationOutput]:
+        if mode not in {"simulmt", "offline"}:
+            raise ValueError("mode must be either 'simulmt' or 'offline'")
+    
         self.model.eval()
-
+    
         batch_start = time.perf_counter()
-
+    
         source_ids = batch["source_ids"].to(
             self.device,
             non_blocking=True,
         ).long()
-
+    
         source_mask = batch["source_mask"].to(
             self.device,
             non_blocking=True,
         ).long()
-
+    
         if self.max_source_len is not None:
             source_ids = source_ids[:, :self.max_source_len]
             source_mask = source_mask[:, :self.max_source_len]
-
+    
         batch_size, src_len = source_ids.shape
-
         source_lens = source_mask.sum(dim=1).long().clamp_min(1)
-
+    
         decoder_input_ids = torch.full(
             size=(batch_size, 2),
             fill_value=self.pad_token_id,
             dtype=torch.long,
             device=self.device,
         )
-
+    
         decoder_input_ids[:, 0] = self.decoder_start_token_id
         decoder_input_ids[:, 1] = self.target_lang_token_id
-
+    
         finished = torch.zeros(
             batch_size,
             dtype=torch.bool,
             device=self.device,
         )
-
+    
         delays: list[list[int]] = [[] for _ in range(batch_size)]
-
+    
         first_token_latency_sec = None
         generation_start = time.perf_counter()
-
-        for step in range(max_new_tokens):
-            visible_lens = torch.minimum(
-                source_lens,
-                torch.full_like(source_lens, wait_k + step * speed),
-            ).clamp_min(1)
-
-            prefix_source_ids, prefix_source_mask = self._make_source_prefix_batch(
+    
+        if mode == "offline":
+            full_source_ids, full_source_mask = self._make_source_prefix_batch(
                 source_ids=source_ids,
                 source_mask=source_mask,
-                visible_lens=visible_lens,
+                visible_lens=source_lens,
             )
-
+    
+        for step in range(max_new_tokens):
+            if mode == "simulmt":
+                visible_lens = torch.minimum(
+                    source_lens,
+                    torch.full_like(source_lens, wait_k + step * speed),
+                ).clamp_min(1)
+    
+                prefix_source_ids, prefix_source_mask = self._make_source_prefix_batch(
+                    source_ids=source_ids,
+                    source_mask=source_mask,
+                    visible_lens=visible_lens,
+                )
+    
+            else:
+                visible_lens = source_lens
+                prefix_source_ids = full_source_ids
+                prefix_source_mask = full_source_mask
+    
             decoder_attention_mask = decoder_input_ids.ne(self.pad_token_id).long()
-
+    
             with torch.autocast(
                 device_type="cuda",
                 enabled=self.use_amp and self.device.type == "cuda",
@@ -231,62 +247,67 @@ class NLLBSimulMTAdapter:
                     use_cache=False,
                     return_dict=True,
                 )
-
+    
                 next_logits = outputs.logits[:, -1, :]
-
+    
             next_token = next_logits.argmax(dim=-1)
-
+    
             next_token = torch.where(
                 finished,
                 torch.full_like(next_token, self.pad_token_id),
                 next_token,
             )
-
+    
             if first_token_latency_sec is None:
                 first_token_latency_sec = time.perf_counter() - generation_start
-
+    
             active_before_step = ~finished
-
+    
             for i in range(batch_size):
                 if bool(active_before_step[i].item()):
                     delays[i].append(int(visible_lens[i].item()))
-
+    
             decoder_input_ids = torch.cat(
                 [decoder_input_ids, next_token[:, None]],
                 dim=1,
             )
-
-            if stop_after_eos_when_full_source_read:
+    
+            if mode == "offline":
+                finished |= next_token.eq(self.eos_token_id)
+            elif stop_after_eos_when_full_source_read:
                 finished |= (
                     next_token.eq(self.eos_token_id)
                     & (visible_lens >= source_lens)
                 )
             else:
                 finished |= next_token.eq(self.eos_token_id)
-
+    
             if bool(finished.all().item()):
                 break
-
+    
         total_batch_time = time.perf_counter() - batch_start
-
+    
         decoder_input_ids_cpu = decoder_input_ids.detach().cpu()
-
-        outputs: list[TranslationOutput] = []
-
+    
         generated_only = decoder_input_ids_cpu[:, 2:]
-
+    
         hypothesis_texts = self.tokenizer.batch_decode(
             generated_only.tolist(),
             skip_special_tokens=True,
         )
-
+    
+        outputs: list[TranslationOutput] = []
+    
         for i in range(batch_size):
             hyp_ids = generated_only[i].tolist()
-
+    
             if self.eos_token_id in hyp_ids:
                 eos_pos = hyp_ids.index(self.eos_token_id)
                 hyp_ids = hyp_ids[:eos_pos + 1]
-
+    
+            while hyp_ids and hyp_ids[-1] == self.pad_token_id:
+                hyp_ids.pop()
+    
             outputs.append(
                 TranslationOutput(
                     hypothesis_ids=hyp_ids,
@@ -298,8 +319,10 @@ class NLLBSimulMTAdapter:
                     extra={
                         "decoder_start_token_id": self.decoder_start_token_id,
                         "target_lang_token_id": self.target_lang_token_id,
+                        "mode": mode,
+                        "offline": mode == "offline",
                     },
                 )
             )
-
+    
         return outputs

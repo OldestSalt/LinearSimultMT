@@ -322,7 +322,7 @@ def load_training_checkpoint(
     train_cfg = TrainConfig(**checkpoint["train_cfg"])
     train_time = checkpoint["train_time"]
 
-    student = torch.compile(model_class(model_cfg))
+    student = model_class(model_cfg)
     student.load_state_dict(checkpoint["model_state_dict"])
     student.to(device)
     optimizer = torch.optim.AdamW(

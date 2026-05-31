@@ -1,13 +1,85 @@
 import numpy as np
 from .classes import SentenceLatency
 from sacrebleu.metrics import BLEU, CHRF, TER
+import torch
 
 
 class MTQualityScorer:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        use_comet: bool = False,
+        comet_model_name: str = "Unbabel/wmt22-comet-da",
+        comet_batch_size: int = 8,
+        comet_gpus: int | None = None,
+    ):
         self.bleu = BLEU(tokenize="13a")
         self.chrf = CHRF(word_order=2)
         self.ter = TER()
+
+        self.use_comet = use_comet
+        self.comet_model_name = comet_model_name
+        self.comet_batch_size = comet_batch_size
+        self.comet_gpus = comet_gpus
+        self.comet_model = None
+
+        if use_comet:
+            self._load_comet()
+
+    def _load_comet(self):
+        try:
+            from comet import download_model, load_from_checkpoint
+        except ImportError as e:
+            raise ImportError(
+                "COMET is not installed. Install it with: pip install unbabel-comet"
+            ) from e
+
+        model_path = download_model(self.comet_model_name)
+        self.comet_model = load_from_checkpoint(model_path)
+
+    def _score_comet(
+        self,
+        *,
+        sources: list[str],
+        hypotheses: list[str],
+        references: list[str],
+    ) -> dict[str, float]:
+        if self.comet_model is None:
+            self._load_comet()
+
+        data = [
+            {
+                "src": src,
+                "mt": hyp,
+                "ref": ref,
+            }
+            for src, hyp, ref in zip(sources, hypotheses, references)
+        ]
+
+        gpus = self.comet_gpus
+        if gpus is None:
+            gpus = 1 if torch.cuda.is_available() else 0
+
+        output = self.comet_model.predict(
+            data,
+            batch_size=self.comet_batch_size,
+            gpus=gpus,
+            progress_bar=True,
+        )
+
+        # Different COMET versions expose the system score slightly differently.
+        if isinstance(output, tuple):
+            _, system_score = output
+        elif hasattr(output, "system_score"):
+            system_score = output.system_score
+        elif isinstance(output, dict) and "system_score" in output:
+            system_score = output["system_score"]
+        else:
+            raise RuntimeError(f"Unsupported COMET output type: {type(output)}")
+
+        return {
+            "COMET": float(system_score),
+        }
 
     def score(
         self,
@@ -16,11 +88,22 @@ class MTQualityScorer:
         hypotheses: list[str],
         references: list[str],
     ) -> dict[str, float]:
-        return {
+        scores = {
             "BLEU": float(self.bleu.corpus_score(hypotheses, [references]).score),
             "chrF++": float(self.chrf.corpus_score(hypotheses, [references]).score),
             "TER": float(self.ter.corpus_score(hypotheses, [references]).score),
         }
+
+        if self.use_comet:
+            scores.update(
+                self._score_comet(
+                    sources=sources,
+                    hypotheses=hypotheses,
+                    references=references,
+                )
+            )
+
+        return scores
 
 
 class WaitKLatencyScorer:
